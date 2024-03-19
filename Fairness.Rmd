@@ -1,0 +1,758 @@
+---
+title: "Fairness"
+author: "Your Name"
+date: "2023-02-07"
+output: html_document
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,message=FALSE,fig.align="center",fig.width=7,fig.height=6)
+pacman::p_load(
+       car
+       ,data.table
+       ,formattable
+      , ggplot2
+      , ggExtra
+      , grid
+      , gridExtra
+      , ggmosaic
+      , reshape2
+      , corrplot
+      , RColorBrewer
+      , lubridate
+      , ggdag
+      , mlr3fairness
+      , fairness
+      , fairmodels
+      , mlr3
+      , dplyr
+      )
+# bibliography: lecture.bib
+```
+
+```{css,echo=FALSE}
+.btn {
+    border-width: 0 0px 0px 0px;
+    font-weight: normal;
+    text-transform: ;
+}
+
+.btn-default {
+    color: #2ecc71;
+    background-color: #ffffff;
+    border-color: #ffffff;
+}
+button.btn.collapsed:before
+{
+    content:'+' ;
+    display:block;
+    width:15px;
+}
+button.btn:before
+{
+    content:'-' ;
+    display:block;
+    width:15px;
+}
+```
+
+```{r,echo=FALSE}
+# Global parameter
+show_code <- TRUE
+```
+
+# Class Workbook {.tabset .tabset-fade .tabset-pills}
+
+## Data Sets
+
+### German Credit Data
+
+A German financial company wants to create a model that predicts the defaults on consumer loans in the German market.  When you are called in, the company has already built a model and asks you to evaluate it because there is a concern that this model unfairly evaluates young customers.  Your task is to figure out if this is true and to devise a way to correct this problem.  The data used to make predictions as well as the predictions can be found in `germancredit` data.
+
+```{r}
+#install.packages('fairness')
+data('germancredit',package ="fairness")
+```
+The data contains the outcome of interest `BAD` indicating whether a customer has defaulted on a loan.  A model to predict default has already been fit and predicted probabilities of default (`probability`) and predicted status coded as yes/no for default (`predicted`) have been concatenated to the original data.  
+
+### Casual assessment
+
+Let's look at the prediction made by some model that was fit.  
+
+Here is the confusion matrix:
+
+```{r}
+model_pred=factor(ifelse(germancredit$predicted ==1, "PredYesDefault", "PredNoDefault"),
+                  levels=c("PredYesDefault", "PredNoDefault"))
+CM= table(model_pred,germancredit$BAD)
+print(CM)
+```
+&nbsp; | Actual 1.            | Actual 0                  |
+-------|:--------------------:|:-------------------------:|
+Pred 1 |   TP=`r CM[1,1]`     |    FP    =`r CM[1,2]`     |
+Pred 0 |   FN=`r CM[2,1]`     |    TN    =`r CM[2,2]`     |
+
+It looks OK.
+
+Here is the ROC curve:
+```{r,echo=show_code,fig.width=5,fig.height=5}
+library(pROC)
+roc_score=roc(germancredit$BAD, germancredit$probability) #AUC score
+plot(roc_score ,main ="ROC curve -- Logistic Regression ")
+```
+Again, pretty good.
+
+The decile plot looks decent as well.
+```{r,echo=show_code,fig.width=7,fig.height=5}
+lift <- function(depvar, predcol, groups=10) {
+  if(is.factor(depvar)) depvar <- as.integer(as.character(depvar))
+  if(is.factor(predcol)) predcol <- as.integer(as.character(predcol))
+  helper = data.frame(cbind(depvar, predcol))
+  helper[,"bucket"] = ntile(-helper[,"predcol"], groups)
+  gaintable = helper %>% group_by(bucket)  %>%
+    summarise_at(vars(depvar), list(total = ~n(),
+    totalresp=~sum(., na.rm = TRUE))) %>%
+    mutate(Cumresp = cumsum(totalresp),
+    Gain=Cumresp/sum(totalresp)*100,
+    Cumlift=Gain/(bucket*(100/groups)))
+  return(gaintable)
+}
+library(dplyr)
+default = 1*(germancredit$BAD=="BAD")
+revP =germancredit$probability
+dt = lift(default, revP, groups = 10)
+barplot(dt$totalresp/dt$total,  ylab="Decile", xlab="Bucket")
+abline(h=mean(default ),lty=2,col="red")
+```
+
+The residual does show a little concerning point on the right but it's not obvious.
+```{r,fig.width=5,fig.height=5}
+arm::binnedplot(germancredit$probability,default-germancredit$probability)
+```
+
+So overall, if you just used the traditional evaluation method, you would conclude that there is no problem.
+
+### Digging deeper
+
+Now, let's look at this by age and gender.
+
+```{r,echo=show_code,fig.width=7,fig.height=5}
+germancredit$Age_cat=  cut(germancredit$Age,c(0,25,35,45,75))
+germancredit$FemaleAge_cat= germancredit$Female: germancredit$Age_cat
+ggplot(germancredit)+geom_bar()+aes(x=Age_cat,fill=BAD)+facet_grid(~Female)
+```
+
+You see more females in 25-50 range is represented in the dataset.  
+```{r}
+ggplot(germancredit)+geom_bar(position="fill")+aes(x=Age_cat,fill=BAD)+facet_grid(~Female)
+```
+
+The proportion of females that actually defaulted is lower than that of males.
+
+The mosaic plot shows some discrepancy in the default probability by age group.
+```{r,fig.width=7,fig.height=5}
+#install.packages("ggmosaic")
+library(ggmosaic)
+ggplot(data = germancredit) +
+  geom_mosaic(aes(x = product(BAD,Age_cat),fill=BAD)) + 
+  labs(title='f(BAD | age) f(age)')
+```
+
+The confusion matrix conditioned on age:
+```{r}
+CM= table(model_pred,germancredit$BAD,germancredit$Age_cat)
+print(CM)
+##knitr::kable(CM)
+```
+
+
+### COMPAS
+
+In the US, judges, probation officers, and parole officers use algorithms to evaluate the likelihood of a criminal defendant re-offending, a concept commonly referred to as recidivism. Numerous risk assessment algorithms are circulating with two prominent nationwide tools provided by commercial vendors.
+
+One of these tools, Northpointe's COMPAS (Correctional Offender Management Profiling for Alternative Sanctions), has made national headlines about how it seems to have a bias towards certain protected groups. Your job is to figure out if this is the case.
+
+https://github.com/propublica/compas-analysis/
+
+```{r}
+data("compas", package = "mlr3fairness")
+?compas
+compas_df <- mutate(compas, crime_factor = factor(c_charge_degree)) %>%
+  mutate(age_factor = as.factor(age_cat)) %>%
+  within(age_factor <- relevel(age_factor, ref = 1)) %>%
+  mutate(race_factor = factor(race)) %>%
+  within(race_factor <- relevel(race_factor, ref = 3)) %>%
+  mutate(gender_factor = factor(sex, labels= c("Female","Male"))) %>%
+  within(gender_factor <- relevel(gender_factor, ref = 2)) %>%
+  mutate(score_factor = factor(score_text != "Low", labels = c("LowScore","HighScore")))
+```
+
+The variable of interest is the `two_year_recid`, indicating if the individual committed a crime within two years.
+```{r}
+table(compas$two_year_recid)
+```
+
+There are two score for recidivism risk
+```{r}
+compas$score_text<-factor(compas$score_text, levels =c("Low", "Medium","High"))
+table(compas$score_text,compas$two_year_recid)
+ggplot(data=compas, aes(x=score_text,fill=two_year_recid)) + 
+          geom_bar() + xlab("Decile Score") +
+          ylim(0, 1300) + ggtitle("Overall Risk")
+```
+
+Another is the decile score
+```{r}
+table(compas$decile_score,compas$two_year_recid)
+
+ggplot(data=compas, aes(x=decile_score,fill=two_year_recid)) + 
+          geom_bar() + xlab("Decile Score") +
+          ylim(0, 1300) + ggtitle("Overall Decile Scores")
+```
+
+If you look at the risk and the outcome by race you can see discrepancies.
+```{r}
+pblack <- ggplot(data=filter(compas, race =="African-American"), aes(ordered(decile_score),fill=two_year_recid) )+ 
+          geom_bar() + xlab("Decile Score") +
+          ylim(0, 650) + ggtitle("Black Defendant's Decile Scores")
+pwhite <- ggplot(data=filter(compas, race =="Caucasian"), aes(ordered(decile_score),fill=two_year_recid)) + 
+          geom_bar() + xlab("Decile Score") +
+          ylim(0, 650) + ggtitle("White Defendant's Decile Scores")
+grid.arrange(pblack, pwhite,  ncol = 2)
+
+```
+
+How would you evaluate the COMPAS result?
+
+
+### Adult Census Data
+
+The dataset used to predict whether income exceeds $50K/yr based on census data. Also known as the "Census Income" dataset Train dataset contains 13 features and 30178 observations. Test dataset contains 13 features and 15315 observations. Target column is "target": A binary factor where 1: <=50K and 2: >50K for annual income. The column "sex" is set as a protected attribute.
+
+```{r}
+data("adult_train", package = "mlr3fairness")
+# data("adult_test", package = "mlr3fairness")
+?adult_train
+```
+
+Here are the EDA result.
+```{r,fig.width=20,fig.height=15}
+ggplot(melt(adult_train,id.vars = "target"))+
+    geom_bar(position="stack", stat="count")+ aes(x=value,fill=target)+facet_wrap(~variable,scales="free")+scale_y_log10()+coord_flip()
+```
+
+Researchers wants to know who makes more money.  So they fit a logistic regression.
+```{r}
+adult_glm_model <- glm(target~ age+workclass+education_num+marital_status+occupation+relationship+race+sex, 
+  ,data=adult_train,family=binomial(link="logit"))
+```
+
+How does the residuals look like?
+```{r,fig.width=5,fig.height=5}
+arm::binnedplot(adult_glm_model$fitted,resid(adult_glm_model,type="response"))
+```
+
+How about a decile plot?
+```{r}
+default = 1*(adult_train$target==">50K")
+revP =adult_glm_model$fitted
+dt = lift(default, revP, groups = 10)
+barplot(dt$totalresp/dt$total,  ylab="Decile", xlab="Bucket")
+abline(h=mean(default ),lty=2,col="red")
+```
+
+What is the conclusion?  Is there a problem?
+
+### Diabetes dataset
+
+The diabetes dataset describes the clinical care at 130 US hospitals and integrated delivery networks from 1999 to 2008. The classification task is to predict whether a patient will readmit within 30 days. 
+
+https://fairlearn.org/main/user_guide/datasets/diabetes_hospital_data.html
+https://www.hindawi.com/journals/bmri/2014/781670/
+
+We grabbed the preprocessed data so you don't need to clean it.
+```{r}
+diabetic <- fread("diabetic_preprocessed.csv")
+```
+
+The target is `readmit_30_days`, which is a binary attribute that indicates whether the patient was readmitted within 30 days.
+```{r}
+table(diabetic$readmit_30_days)
+```
+
+The researchers fit a glm model.
+```{r}
+diabetes_glm_model <- glm(readmit_30_days~race+gender+age+discharge_disposition_id+admission_source_id+time_in_hospital+medical_specialty+num_lab_procedures+num_procedures+num_medications+primary_diagnosis+number_diagnoses+max_glu_serum+A1Cresult+insulin+change+diabetesMed+medicare+medicaid+had_emergency+had_inpatient_days+had_outpatient_days, 
+  data=diabetic,
+  family=binomial(link="logit"))
+```
+
+ROC
+```{r,echo=show_code,fig.width=5,fig.height=5}
+library(pROC)
+roc_score=roc(diabetic$readmit_30_days, diabetes_glm_model$fitted) #AUC score
+plot(roc_score ,main ="ROC curve -- Logistic Regression ")
+```
+
+How does the residuals look like?
+```{r,fig.width=5,fig.height=5}
+arm::binnedplot(diabetes_glm_model$fitted,resid(diabetes_glm_model,type="response"))
+```
+
+The confusion matrix is not useful since by default cutoff of 0.5 everyone is predicted as 0.
+```{r}
+CM= table(1*(diabetes_glm_model$fitted>0.5),diabetic$readmit_30_days)
+print(CM)
+##knitr::kable(CM)
+```
+
+How about a decile plot?
+```{r}
+revP =diabetes_glm_model$fitted
+dt = lift(diabetic$readmit_30_days, revP, groups = 10)
+barplot(dt$totalresp/dt$total,  ylab="Decile", xlab="Bucket")
+abline(h=mean(diabetic$readmit_30_days ),lty=2,col="red")
+```
+
+You see that the model is capturing something.
+Do you see any problem with this model with protected attributes such as race and gender?
+
+## In class activity
+
+Choose one of the data described above as your target problem.
+
+~~~
+Please write your answer in full sentences.
+
+
+~~~
+
+Discuss what a favorable label in this problem is and what does a favorable label grant the affected user?
+Is it assertive or non-punitive?
+
+~~~
+Please write your answer in full sentences.
+
+
+~~~
+
+What type of justice is this issue about?
+
+~~~
+Please write your answer in full sentences.
+
+
+~~~
+
+Discuss the potential concerns about the data being used. 
+
+~~~
+Please write your answer in full sentences.
+
+
+~~~
+
+Discuss what type of group fairness metrics is appropriate for this problem.
+
+~~~
+Please write your answer in full sentences.
+
+
+~~~
+
+Using the appropriate fairness metrics, show if there are concerns in the prediction algorithm.
+
+```{r}
+#
+#
+```
+
+~~~
+Please write your answer in full sentences.
+
+
+~~~
+
+Given that you have access to the original data, but not to the model used to make the prediction, discuss which mitigation strategy might be more appropriate to deal with the problem, if any.
+
+```{r}
+#
+#
+```
+
+~~~
+Please write your answer in full sentences.
+
+
+~~~
+
+
+## Fairness Metrics
+
+Fairness metrics have several ways to classify them.  Many fairness metrics for discrete outcomes are derived using the conditional confusion matrix.   For each of the protected groups of interest, we can define a conditional confusion matrix as:
+
+&nbsp; |    Actual 1 |    Actual 0 |$\dots$ |    Actual 1 |    Actual 0 |
+-------|:-----------:|:-----------:|:-----: |:-----------:|:-----------:|
+Pred 1 |   $TP_{g1}$ | $FP_{g1}$   |$\dots$ |   $TP_{g2}$ | $FP_{g2}$   |
+Pred 0 |   $FN_{g1}$ | $TN_{g1}$   |$\dots$ |   $FN_{g2}$ | $TN_{g2}$   |
+
+Depending on the context different metrics are appropriate.
+
+### Definitions Based on Predicted Outcome That Does not require Actual outcomes
+
+#### Demographic parity (Statistical Parity, Equal Parity, Equal Acceptance Rate or Independence)
+
+Demographic parity is one of the most popular fairness indicators in the literature. 
+
+Demographic parity is achieved if the absolute number of positive predictions in the subgroups are close to each other.
+$$(TP_g + FP_g)$$
+This measure does not take true class into consideration and only depends on the model predictions. In some literature, demographic parity is also referred to as statistical parity or independence.
+
+```{r}
+res_dem <- dem_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res_dem$Metric
+res_dem$Metric_plot
+```
+
+Of course, comparing the absolute number of positive predictions will show a high disparity when the number of cases within each group is different, which artificially boosts the disparity. This is true in our case:
+
+```{r}
+table(germancredit$Female)
+```
+
+#### Proportional parity (Impact Parity or Minimizing Disparate Impact) [Calders and Verwer 2010]
+
+Proportional parity is calculated based on the comparison of the proportion of all positively classified individuals in all subgroups of the data. 
+$$(TP_g + FP_g) / (TP_g + FP_g + TN_g + FN_g)$$
+Proportional parity is very similar to demographic parity but modifies it to address the issue that when the number of cases within each group is different, which artificially boosts the disparity. In some literature, proportional parity and demographic parity are considered equivalent, which is true when the protected group sizes are equivalent.  Proportional parity is achieved if the proportion of positive predictions in the subgroups are close to each other. Similar to the demographic parity, this measure also does not depend on the true labels.
+
+In the returned named vector, the reference group will be assigned 1, while all other groups will be assigned values according to whether their proportion of positively predicted observations are lower or higher compared to the reference group. Lower proportions will be reflected in numbers lower than 1 in the returned named vector.
+ 
+```{r}
+res_prop <- prop_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res_prop$Metric
+res_prop$Metric_plot
+
+```
+
+
+
+### Definitions Based on Predicted and Actual Outcomes
+#### Predictive rate parity
+
+ Predictive rate parity is achieved if the precisions (or positive predictive values) in the subgroups are close to each other. The precision stands for the number of the true positives divided by the total number of examples predicted positive within a group.
+ $$TP_g / (TP_g + FP_g)$$
+ 
+```{r}
+res1 <- pred_rate_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res1$Metric
+
+```
+The first row shows the raw precision values for the age groups. The second row displays the relative previsions compared to a 0-25 age group.
+
+In a perfect world, all predictive rate parities should be equal to one, which would mean that precision in every group is the same as in the base group. In practice, values are going to be different. The parity above one indicates that precision in this group is relatively higher, whereas a lower parity implies a lower precision. Observing a large variance in parities should hint that the model is not performing equally well for different age groups.
+
+The result suggests that the model is worse for younger people. This implies that there are more cases where the model mistakingly predicts that a person will default if they are young.
+
+```{r}
+res1$Metric_plot
+res1$Probability_plot
+```
+
+If the middle aged group is set as a base group, the raw precision values do not change, only the relative metrics will change.
+
+```{r}
+res1m <- pred_rate_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(25,35]')
+res1m$Metric
+res1m$Metric_plot
+```
+
+
+#### False negative rate parity [Chouldechova 2017]
+
+False negative rates are calculated by the division of false negatives with all positives (irrespective of predicted values). 
+$$FN_g / (TP_g + FN_g)$$
+False negative rate parity is achieved if the false negative rates (the ratio between the number of false negatives and the total number of positives) in the subgroups are close to each other.
+
+In the returned named vector, the reference group will be assigned 1, while all other groups will be assigned values according to whether their false negative rates are lower or higher compared to the reference group. Lower false negative error rates will be reflected in numbers lower than 1 in the returned named vector, thus numbers lower than 1 mean BETTER prediction for the subgroup.
+
+
+```{r}
+res_fnr <- fnr_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res_fnr$Metric
+res_fnr$Metric_plot
+```
+#### False positive rate parity [Chouldechova 2017]
+
+False positive rates are calculated by the division of false positives with all negatives (irrespective of predicted values). 
+$$FP_g / (TN_g + FP_g)$$
+False positive rate parity is achieved if the false positive rates (the ratio between the number of false positives and the total number of negatives) in the subgroups are close to each other.
+
+In the returned named vector, the reference group will be assigned 1, while all other groups will be assigned values according to whether their false positive rates are lower or higher compared to the reference group. Lower false positives error rates will be reflected in numbers lower than 1 in the returned named vector, thus numbers lower than 1 mean BETTER prediction for the subgroup.
+
+
+```{r}
+res_fpr <- fpr_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res_fpr$Metric
+```
+#### Equalized odds (Equal Opportunity, Positive Rate Parity or Separation)
+
+Equalized Odds are calculated by the division of true positives with all positives (irrespective of predicted values). 
+$$TP_g / (TP_g + FN_g)$$
+This metrics equals to what is traditionally known as sensitivity. 
+
+In the returned named vector, the reference group will be assigned 1, while all other groups will be assigned values according to whether their sensitivities are lower or higher compared to the reference group. Lower sensitivities will be reflected in numbers lower than 1 in the returned named vector, thus numbers lower than 1 mean WORSE prediction for the subgroup.  Equalized odds are achieved if the sensitivities in the subgroups are close to each other. 
+
+
+```{r}
+res_eq <- equal_odds(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res_eq$Metric
+res_eq$Metric_plot
+
+```
+
+#### Accuracy parity [Friedler et al., 2018]
+
+Accuracy metrics are calculated by the division of correctly predicted observations (the sum of all true positives and true negatives) with the number of all predictions. 
+$$(TP_g + TN_g) / (TP_g + FP_g + TN_g + FN_g)$$
+Accuracy parity is achieved if the accuracies (all accurately classified examples divided by the total number of examples) in the subgroups are close to each other.
+
+In the returned named vector, the reference group will be assigned 1, while all other groups will be assigned values according to whether their accuracies are lower or higher compared to the reference group. Lower accuracies will be reflected in numbers lower than 1 in the returned named vector, thus numbers lower than 1 mean WORSE prediction for the subgroup.
+
+
+
+
+
+```{r}
+res_acc <- acc_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res_acc$Metric
+res_acc$Metric_plot
+```
+
+
+
+#### Negative predictive value parity
+
+Negative predictive value parity can be considered the ‘inverse’ of the predictive rate parity.  Negative Predictive Values are calculated by the division of true negatives with all predicted negatives. 
+$$TN / (TN + FN)$$
+Negative predictive value parity is achieved if the negative predictive values in the subgroups are close to each other. 
+
+
+In the returned named vector, the reference group will be assigned 1, while all other groups will be assigned values according to whether their negative predictive values are lower or higher compared to the reference group. Lower negative predictive values will be reflected in numbers lower than 1 in the returned named vector, thus numbers lower than 1 mean WORSE prediction for the subgroup.
+
+
+```{r}
+res_npv <- npv_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res_npv$Metric
+res_npv$Metric_plot
+```
+
+
+
+
+#### Matthews correlation coefficient parity
+
+In the returned named vector, the reference group will be assigned 1, while all other groups will be assigned values according to whether their Matthews Correlation Coefficients are lower or higher compared to the reference group. Lower Matthews Correlation Coefficients rates will be reflected in numbers lower than 1 in the returned named vector, thus numbers lower than 1 mean WORSE prediction for the subgroup.
+
+
+The Matthews correlation coefficient (MCC) considers all four classes of the confusion matrix. MCC is sometimes referred to as the single most powerful metric in binary classification problems, especially for data with class imbalances.
+
+$$(TP_g×TN_g-FP_g×FN_g)/\sqrt{((TP_g+FP_g)×(TP_g+FN_g)×(TN_g+FP_g)×(TN_g+FN_g))}$$
+
+```{r}
+res_mcc <- mcc_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res_mcc$Metric
+res_mcc$Metric_plot
+```
+
+
+#### Specificity parity
+
+Specificity parity can be considered the ‘inverse’ of the equalized odds.  Specificity is calculated by the division of true negatives with all negatives (irrespective of predicted values). 
+$$TN_g / (TN_g + FP_g)$$  
+ Specificity parity is achieved if the specificity (the ratio of the number of the true negatives and the total number of negatives) in the subgroups are close to each other.
+ 
+ In the returned named vector, the reference group will be assigned 1, while all other groups will be assigned values according to whether their specificity is lower or higher compared to the reference group. Lower specificity will be reflected in numbers lower than 1 in the returned named vector, thus numbers lower than 1 mean WORSE prediction for the subgroup.
+
+```{r}
+res_sp <- spec_parity(data         = germancredit, 
+                         outcome      = 'BAD', 
+                         outcome_base = 'BAD', 
+                         group        = 'Age_cat',
+                         probs        = 'probability', 
+                         cutoff       = 0.5, 
+                         base         = '(0,25]')
+res_sp$Metric
+res_sp$Metric_plot
+```
+
+#### ROC AUC parity
+
+The equality of the area under the ROC for different groups identified by protected attributes can be seen as analogous to the equality of accuracy.
+
+This function computes the ROC AUC values for each subgroup. In the returned table, the reference group will be assigned 1, while all other groups will be assigned values according to whether their ROC AUC values are lower or higher compared to the reference group. Lower ROC AUC will be reflected in numbers lower than 1 in the returned named vector, thus numbers lower than 1 mean WORSE prediction for the subgroup.
+
+
+
+This function calculates ROC AUC and visualizes ROC curves for all subgroups. Note that probabilities must be defined for this function. Also, as ROC evaluates all possible cutoffs, the cutoff argument is excluded from this function.
+
+```{r,fig.height=7,fig.width=7}
+res_auc <- roc_parity(data         = germancredit, 
+                      outcome      = 'BAD', 
+                      group        = 'Age_cat',
+                      probs        = 'probability', 
+                      base         = '(0,25]')
+res_auc$Metric
+res_auc$ROCAUC_plot
+```
+Apart from the standard outputs, the function also returns ROC curves for each of the subgroups.
+
+## Software 
+
+A handful of software has been made available over the last few years.  These are usually a combination of fairness metrics calculation, followed by visualizations.
+
+- [fairness](https://cran.r-project.org/web/packages/fairness/index.html)
+- [fairml](https://cran.r-project.org/web/packages/fairml/index.html)
+- [mlr3fairness](https://mlr3fairness.mlr-org.com)
+- [fairmodels](https://github.com/ModelOriented/fairmodels/)
+- [aif360](https://aif360.readthedocs.io/en/latest/index.html)
+
+Because they automate the process, they are useful if you can get them to work.
+Here is an example of using `fairmodels`.
+
+```{r}
+library(mlr3)
+library(mlr3fairness)
+library(fairmodels)
+library(ranger)
+library(DALEX)
+```
+
+### ------------ step 1 - create model(s)  -----------------
+
+We will look at the `germancredit` data again.  But here we will create our model.  As a comparison, let's fit logistic regression and the random forest model.
+
+```{r}
+glm_model <- glm(BAD~Age_cat+Foreign+Female+Duration+Purpose+Num_credits+Job+Housing+Resident_since+Property+Employment+Savings+Amount+Credit_history+Account_status+Duration+Purpose,
+                data = germancredit,
+                family=binomial(link="logit"))
+
+rf_model <- ranger(BAD~Age_cat+Foreign+Female+Duration+Purpose+Num_credits+Job+Housing+Resident_since+Property+Employment+Savings+Amount+Credit_history+Account_status+Duration+Purpose,
+                   data = germancredit,
+                   probability = TRUE,
+                   num.trees = 200)
+```
+
+### ------------  step 2 - create explainer(s)  ------------
+
+You need to create an explainer object.
+```{r}
+# numeric y for explain function
+y_numeric <- as.numeric(germancredit$BAD) -1
+explainer_lm <- explain(glm_model, data = germancredit[,c(1:19,21,24)], y = y_numeric)
+explainer_rf <- explain(rf_model, data = germancredit[,c(1:19,21,24)], y = y_numeric)
+```
+
+
+### ------------  step 3 - fairness check  -----------------
+
+You can run fairness check on one model. Which shows 
+```{r,fig.width=7,fig.height=7}
+ fobject <- fairness_check(explainer_lm,# explainer_rf,
+                           protected = germancredit$Age_cat,
+                           privileged = "(25,35]")
+print(fobject)
+plot(fobject)
+```
+
+Or you can compare the metrics for different models.
+
+```{r,fig.width=7,fig.height=7}
+ fobject_rf <- fairness_check(explainer_lm,explainer_rf,
+                           protected = germancredit$Age_cat,
+                           privileged = "(25,35]")
+print(fobject_rf)
+plot(fobject_rf)
+```
+
+You can check this value for other variables as well.
+
+```{r,fig.width=7,fig.height=7}
+fobject_gender <- fairness_check(explainer_lm,explainer_rf,
+                           protected = germancredit$Female,
+                           privileged = "Male")
+
+plot(fobject_gender)
+```
+
+
+
+
+
+### Reference
+
+https://cran.r-project.org/web/packages/fairness/vignettes/fairness.html
+https://ashryaagr.github.io/Fairness.jl/dev/datasets/
+
+Calders, T., Verwer, S. Three naive Bayes approaches for discrimination-free classification. Data Min Knowl Disc 21, 277–292 (2010). https://doi.org/10.1007/s10618-010-0190-x
